@@ -6,6 +6,7 @@ import (
 	"github.com/tarik0/GethAuth/client"
 	"github.com/tarik0/GethAuth/utils"
 	"golang.org/x/exp/slices"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -18,21 +19,66 @@ var upgrader = websocket.Upgrader{
 	EnableCompression: true,
 }
 
+// The http client.
+var httpClient = &http.Client{}
+
+// Hop-by-hop headers. These are removed when sent to the backend.
+// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
+var hopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te", // canonicalized version of "TE"
+	"Trailers",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// httpRedirect gets triggered when normal RPC request comes.
+func httpRedirect(w http.ResponseWriter, r *http.Request) {
+	// Remove some headers.
+	redirectedReq, err := http.NewRequest(r.Method, os.Getenv("HTTP_RPC"), r.Body)
+	if err != nil {
+		http.Error(w, "500 Internal - Something is fucked up.", http.StatusInternalServerError)
+		log.Fatalln("Unable to redirect http create:", err)
+	}
+
+	// Redirect the http request.
+	res, err := httpClient.Do(redirectedReq)
+	if err != nil {
+		http.Error(w, "500 Internal - Something is fucked up.", http.StatusInternalServerError)
+		log.Fatalln("Unable to redirect http req:", err)
+	}
+	defer res.Body.Close()
+
+	// Remove response headers.
+	for _, h := range hopHeaders {
+		res.Header.Del(h)
+	}
+
+	// Copy response.
+	w.WriteHeader(res.StatusCode)
+	_, err = io.Copy(w, res.Body)
+	if err != nil {
+		http.Error(w, "500 Internal - Something is fucked up.", http.StatusInternalServerError)
+		log.Fatalln("Unable to redirect http req:", err)
+	}
+}
+
 // serverHandler is the websocket handler.
 func serverHandler(w http.ResponseWriter, r *http.Request) {
 	// Get parameters.
 	params := r.URL.Query()
 	if !params.Has("auth") {
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte("403 Forbidden - Unauthorized."))
+		http.Error(w, "403 Forbidden - Unauthorized.", http.StatusForbidden)
 		return
 	}
 
 	// Get keys list.
 	keys, err := utils.ImportKeys("./keys.txt")
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("500 Internal - Something is fucked up."))
+		http.Error(w, "500 Internal - Something is fucked up.", http.StatusInternalServerError)
 		log.Fatalln("Unable to load keys:", err)
 		return
 	}
@@ -40,8 +86,20 @@ func serverHandler(w http.ResponseWriter, r *http.Request) {
 	// Check key.
 	key := params.Get("auth")
 	if !slices.Contains(keys, key) {
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte("403 Forbidden - Unauthorized."))
+		http.Error(w, "400 Bad Request - Invalid scheme.", http.StatusBadRequest)
+		return
+	}
+
+	// Check websocket.
+	upgrade := false
+	for _, header := range r.Header["Upgrade"] {
+		if header == "websocket" {
+			upgrade = true
+			break
+		}
+	}
+	if !upgrade {
+		httpRedirect(w, r)
 		return
 	}
 
@@ -54,7 +112,7 @@ func serverHandler(w http.ResponseWriter, r *http.Request) {
 	defer c.Close()
 
 	// Create new client.
-	internalConn, err := client.NewClient(os.Args[1])
+	internalConn, err := client.NewClient(os.Getenv("WS_RPC"))
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("500 Internal - Something is fucked up."))
