@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/tarik0/GethAuth/client"
@@ -22,27 +23,23 @@ var upgrader = websocket.Upgrader{
 // The http client.
 var httpClient = &http.Client{}
 
-// Hop-by-hop headers. These are removed when sent to the backend.
-// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
-var hopHeaders = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"Te", // canonicalized version of "TE"
-	"Trailers",
-	"Transfer-Encoding",
-	"Upgrade",
-}
-
 // httpRedirect gets triggered when normal RPC request comes.
 func httpRedirect(w http.ResponseWriter, r *http.Request) {
-	// Remove some headers.
-	redirectedReq, err := http.NewRequest(r.Method, os.Getenv("HTTP_RPC"), r.Body)
+	// Copy body.
+	buf := new(bytes.Buffer)
+	_, err := io.Copy(buf, r.Body)
+	if err != nil {
+		http.Error(w, "500 Internal - Something is fucked up.", http.StatusInternalServerError)
+		log.Fatalln("Unable to copy request body:", err)
+	}
+
+	// New request.
+	redirectedReq, err := http.NewRequest(r.Method, os.Getenv("HTTP_RPC"), buf)
 	if err != nil {
 		http.Error(w, "500 Internal - Something is fucked up.", http.StatusInternalServerError)
 		log.Fatalln("Unable to redirect http create:", err)
 	}
+	redirectedReq.Header.Set("Content-Type", "application/json")
 
 	// Redirect the http request.
 	res, err := httpClient.Do(redirectedReq)
@@ -52,14 +49,17 @@ func httpRedirect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer res.Body.Close()
 
-	// Remove response headers.
-	for _, h := range hopHeaders {
-		res.Header.Del(h)
+	// Read response body.
+	buf = new(bytes.Buffer)
+	_, err = io.Copy(buf, res.Body)
+	if err != nil {
+		http.Error(w, "500 Internal - Something is fucked up.", http.StatusInternalServerError)
+		log.Fatalln("Unable to copy request body:", err)
 	}
 
 	// Copy response.
 	w.WriteHeader(res.StatusCode)
-	_, err = io.Copy(w, res.Body)
+	_, err = w.Write(buf.Bytes())
 	if err != nil {
 		http.Error(w, "500 Internal - Something is fucked up.", http.StatusInternalServerError)
 		log.Fatalln("Unable to redirect http req:", err)
